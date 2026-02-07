@@ -167,6 +167,10 @@ go test -v -count=1 -tags nomupdf .
 - 默认：启用 CGO，链接 MuPDF 静态库
 - `nomupdf`：禁用 CGO，所有 MuPDF 函数返回 `ErrInitFailed`，适用于 CI 或无 MuPDF 的环境
 
+## API 参考文档
+
+查看完整 API 文档：[中文](API_CN.md) | [English](API_EN.md)
+
 ## 许可证
 
 AGPL-3.0（与 MuPDF/PyMuPDF 一致）

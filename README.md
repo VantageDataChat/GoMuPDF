@@ -139,6 +139,10 @@ go test -v -count=1 -tags nomupdf .
 - Default: CGO enabled, links against MuPDF static libraries
 - `nomupdf`: Disables CGO, all MuPDF functions return `ErrInitFailed`. Useful for CI or environments without MuPDF.
 
+## API Reference
+
+See the full API documentation: [English](API_EN.md) | [中文](API_CN.md)
+
 ## License
 
 AGPL-3.0 (same as MuPDF/PyMuPDF)
