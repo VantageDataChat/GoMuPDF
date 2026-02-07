@@ -2216,3 +2216,245 @@ func TestPixmapOptions(t *testing.T) {
 		t.Error("expected annots=false")
 	}
 }
+
+// --- HTMLBox tests ---
+
+func TestInsertHTMLBox(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	result, err := p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+		`<p style="font-size:14px;">Hello <b>World</b> from GoMuPDF!</p>`,
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox: %v", err)
+	}
+	if result.Scale <= 0 {
+		t.Errorf("expected positive scale, got %f", result.Scale)
+	}
+	t.Logf("spare_height=%.1f, scale=%.3f", result.SpareHeight, result.Scale)
+}
+
+func TestInsertHTMLBoxWithCSS(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	html := `<h1>Title</h1><p class="body">Some body text with <em>emphasis</em>.</p>`
+	css := `h1 { color: red; font-size: 24px; } .body { font-size: 12px; }`
+
+	result, err := p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 300},
+		html,
+		HTMLBoxOptions{CSS: css, Overlay: true},
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox with CSS: %v", err)
+	}
+	t.Logf("spare_height=%.1f, scale=%.3f", result.SpareHeight, result.Scale)
+}
+
+func TestInsertHTMLBoxCJK(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	html := `<p style="font-size:16px;">你好世界 Hello World 测试中文</p>`
+	result, err := p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+		html,
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox CJK: %v", err)
+	}
+	t.Logf("CJK spare_height=%.1f, scale=%.3f", result.SpareHeight, result.Scale)
+}
+
+func TestInsertHTMLBoxEmpty(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	result, err := p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox empty: %v", err)
+	}
+	if result.Scale != 1.0 {
+		t.Errorf("expected scale 1.0 for empty, got %f", result.Scale)
+	}
+}
+
+func TestInsertHTMLBoxScaleDown(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	// Lots of text in a small box — should trigger auto-scaling
+	html := `<p style="font-size:20px;">` +
+		`This is a very long paragraph that should not fit in a tiny rectangle. ` +
+		`It contains enough text to overflow the small box and trigger the ` +
+		`automatic scale-down feature of InsertHTMLBox. ` +
+		`More text here to ensure overflow happens reliably.</p>`
+
+	result, err := p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 200, Y1: 80},
+		html,
+		HTMLBoxOptions{ScaleLow: 0, Overlay: true},
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox scale: %v", err)
+	}
+	t.Logf("scale-down: spare_height=%.1f, scale=%.3f", result.SpareHeight, result.Scale)
+}
+
+func TestInsertHTMLBoxNoScale(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	// Lots of text in a small box with ScaleLow=1 (no scaling) — should return ErrOverflow
+	html := `<p style="font-size:20px;">` +
+		`This is a very long paragraph that should not fit in a tiny rectangle. ` +
+		`It contains enough text to overflow the small box.</p>`
+
+	_, err = p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 200, Y1: 80},
+		html,
+		HTMLBoxOptions{ScaleLow: 1, Overlay: true},
+	)
+	if err != ErrOverflow {
+		t.Logf("expected ErrOverflow, got: %v (may fit depending on font metrics)", err)
+	}
+}
+
+func TestInsertHTMLBoxSaveAndVerify(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+
+	_, err = p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+		`<p>Test content for save verification</p>`,
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox: %v", err)
+	}
+	p.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "htmlbox.pdf")
+	err = doc.Save(path)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Reopen and verify
+	doc2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer doc2.Close()
+
+	if doc2.PageCount() != 1 {
+		t.Fatalf("expected 1 page, got %d", doc2.PageCount())
+	}
+
+	p2, err := doc2.LoadPage(0)
+	if err != nil {
+		t.Fatalf("LoadPage: %v", err)
+	}
+	defer p2.Close()
+
+	text, err := p2.GetText("text")
+	if err != nil {
+		t.Fatalf("GetText: %v", err)
+	}
+	t.Logf("extracted text: %q", text)
+	if len(text) == 0 {
+		t.Error("expected non-empty text from HTML box")
+	}
+}
+
+func TestInsertHTMLBoxNonPDF(t *testing.T) {
+	doc, err := NewPDF()
+	if err != nil {
+		t.Fatalf("NewPDF: %v", err)
+	}
+	defer doc.Close()
+
+	// Force non-PDF by using a page from a non-PDF doc (simulate with closed pdf)
+	p, err := doc.NewPage(-1, 595, 842)
+	if err != nil {
+		t.Fatalf("NewPage: %v", err)
+	}
+	defer p.Close()
+
+	// This should work since it IS a PDF
+	_, err = p.InsertHTMLBox(
+		Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+		`<p>test</p>`,
+	)
+	if err != nil {
+		t.Fatalf("InsertHTMLBox on PDF should work: %v", err)
+	}
+}

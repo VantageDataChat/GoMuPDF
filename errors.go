@@ -50,4 +50,7 @@ var (
 
 	// ErrXref is returned when xref operations fail.
 	ErrXref = errors.New("gomupdf: xref operation failed")
+
+	// ErrOverflow is returned when content does not fit in the target rectangle.
+	ErrOverflow = errors.New("gomupdf: content overflow, does not fit in rectangle")
 )

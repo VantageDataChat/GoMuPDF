@@ -248,6 +248,19 @@ func WithRotate(angle int) TextInsertOption {
 	return func(c *textInsertConfig) { c.rotate = angle }
 }
 
+// HTMLBoxOptions configures HTML box insertion.
+type HTMLBoxOptions struct {
+	CSS      string  // additional CSS styling
+	ScaleLow float64 // minimum scale factor (0 = auto-shrink to fit, 1 = no scaling)
+	Overlay  bool    // true = foreground, false = background
+}
+
+// HTMLBoxResult contains the result of an HTML box insertion.
+type HTMLBoxResult struct {
+	SpareHeight float64 // remaining height in the rect after content
+	Scale       float64 // actual scale factor used (1.0 = no scaling)
+}
+
 // Predefined colors.
 var (
 	ColorBlack   = Color{0, 0, 0}

@@ -1053,6 +1053,182 @@ static int gomupdf_insert_image(fz_context *ctx, pdf_document *doc, int pno,
 }
 
 // ============================================================
+// HTML box insertion (Story-based)
+// ============================================================
+
+/* Insert HTML content into a rectangle on an existing PDF page.
+   Uses MuPDF's Story API to layout styled HTML/CSS into the given rect.
+   Returns: 0 = all content fitted, 1 = error, 2 = content overflow (didn't fit).
+   spare_height: if non-NULL, receives the remaining height in the rect.
+   scale_used: if non-NULL, receives the actual scale factor used. */
+static int gomupdf_insert_htmlbox(fz_context *ctx, pdf_document *doc, int pno,
+    float x0, float y0, float x1, float y1,
+    const char *html, const char *css, float scale_low, int overlay,
+    float *spare_height, float *scale_used) {
+    int errcode = 0;
+    fz_try(ctx) {
+        pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
+
+        /* Get page mediabox for Y coordinate conversion */
+        fz_rect mediabox;
+        fz_matrix page_ctm;
+        pdf_page_obj_transform(ctx, page_obj, &mediabox, &page_ctm);
+        float page_height = mediabox.y1 - mediabox.y0;
+
+        /* Convert from top-left origin (Go API) to PDF bottom-left origin.
+           Input rect: (x0,y0)=top-left, (x1,y1)=bottom-right in top-left coords.
+           PDF rect: (x0, page_height-y1) to (x1, page_height-y0). */
+        float pdf_y0 = page_height - y1;
+        float pdf_y1 = page_height - y0;
+        fz_rect where = {x0, pdf_y0, x1, pdf_y1};
+
+        float rect_w = where.x1 - where.x0;
+        float rect_h = where.y1 - where.y0;
+        if (rect_w <= 0 || rect_h <= 0) {
+            if (spare_height) *spare_height = 0;
+            if (scale_used) *scale_used = 1.0f;
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid rectangle");
+        }
+
+        /* Create the story from HTML + CSS */
+        fz_buffer *html_buf = fz_new_buffer_from_copied_data(ctx,
+            (const unsigned char *)html, strlen(html));
+        fz_story *story = fz_new_story(ctx, html_buf, css, 12.0f, NULL);
+        fz_drop_buffer(ctx, html_buf);
+
+        /* Try to place the story; if it doesn't fit, optionally scale down */
+        float scale = 1.0f;
+        int more = 0;
+        fz_rect filled = fz_empty_rect;
+
+        more = fz_place_story(ctx, story, where, &filled);
+
+        if (more && scale_low < 1.0f) {
+            /* Content didn't fit — try scaling down */
+            float lo = (scale_low > 0) ? scale_low : 0.05f;
+            float hi = 1.0f;
+            /* Binary search for the right scale */
+            for (int iter = 0; iter < 20; iter++) {
+                float mid = (lo + hi) / 2.0f;
+                fz_reset_story(ctx, story);
+                fz_rect scaled_where = {
+                    where.x0, where.y0,
+                    where.x0 + rect_w / mid,
+                    where.y0 + rect_h / mid
+                };
+                fz_rect test_filled = fz_empty_rect;
+                int test_more = fz_place_story(ctx, story, scaled_where, &test_filled);
+                if (test_more)
+                    hi = mid;
+                else {
+                    lo = mid;
+                    if (hi - lo < 0.005f) break;
+                }
+            }
+            scale = lo;
+            /* Final placement at the found scale */
+            fz_reset_story(ctx, story);
+            fz_rect scaled_where = {
+                where.x0, where.y0,
+                where.x0 + rect_w / scale,
+                where.y0 + rect_h / scale
+            };
+            filled = fz_empty_rect;
+            more = fz_place_story(ctx, story, scaled_where, &filled);
+        }
+
+        /* Draw the story to a pdf_page_write device to capture content stream */
+        pdf_obj *resources = NULL;
+        fz_buffer *contents = NULL;
+        fz_device *dev = pdf_page_write(ctx, doc, mediabox, &resources, &contents);
+
+        fz_matrix draw_ctm = fz_identity;
+        if (scale < 1.0f) {
+            /* Scale around the top-left corner of the target rect */
+            draw_ctm = fz_concat(
+                fz_translate(-where.x0, -where.y0),
+                fz_concat(fz_scale(scale, scale), fz_translate(where.x0, where.y0))
+            );
+        }
+
+        fz_draw_story(ctx, story, dev, draw_ctm);
+        fz_close_device(ctx, dev);
+        fz_drop_device(ctx, dev);
+
+        /* Merge resources from the story into the page's resources */
+        pdf_obj *page_resources = pdf_dict_get(ctx, page_obj, PDF_NAME(Resources));
+        if (!page_resources)
+            page_resources = pdf_dict_put_dict(ctx, page_obj, PDF_NAME(Resources), 4);
+
+        /* Merge each resource category (Font, XObject, ExtGState, etc.) */
+        static const pdf_obj *res_keys[] = {
+            PDF_NAME(Font), PDF_NAME(XObject), PDF_NAME(ExtGState),
+            PDF_NAME(ColorSpace), PDF_NAME(Pattern), PDF_NAME(Shading),
+            PDF_NAME(Properties), NULL
+        };
+        for (int ki = 0; res_keys[ki] != NULL; ki++) {
+            pdf_obj *key = (pdf_obj *)res_keys[ki];
+            pdf_obj *src_dict = pdf_dict_get(ctx, resources, key);
+            if (!src_dict) continue;
+            pdf_obj *dst_dict = pdf_dict_get(ctx, page_resources, key);
+            if (!dst_dict)
+                dst_dict = pdf_dict_put_dict(ctx, page_resources, key, 4);
+            int n = pdf_dict_len(ctx, src_dict);
+            for (int i = 0; i < n; i++) {
+                pdf_obj *k = pdf_dict_get_key(ctx, src_dict, i);
+                pdf_obj *v = pdf_dict_get_val(ctx, src_dict, i);
+                pdf_dict_put(ctx, dst_dict, k, v);
+            }
+        }
+
+        /* Append the content stream to the page */
+        pdf_obj *existing = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
+        pdf_obj *newstream = pdf_add_stream(ctx, doc, contents, NULL, 0);
+        if (pdf_is_array(ctx, existing)) {
+            if (overlay)
+                pdf_array_push(ctx, existing, newstream);
+            else
+                pdf_array_insert(ctx, existing, newstream, 0);
+        } else {
+            pdf_obj *arr = pdf_new_array(ctx, doc, 2);
+            if (existing) {
+                if (overlay) {
+                    pdf_array_push(ctx, arr, existing);
+                    pdf_array_push(ctx, arr, newstream);
+                } else {
+                    pdf_array_push(ctx, arr, newstream);
+                    pdf_array_push(ctx, arr, existing);
+                }
+            } else {
+                pdf_array_push(ctx, arr, newstream);
+            }
+            pdf_dict_put(ctx, page_obj, PDF_NAME(Contents), arr);
+            pdf_drop_obj(ctx, arr);
+        }
+        pdf_drop_obj(ctx, newstream);
+
+        /* Calculate spare height */
+        if (spare_height) {
+            float used_h = filled.y1 - filled.y0;
+            *spare_height = rect_h - used_h * scale;
+            if (*spare_height < 0) *spare_height = 0;
+        }
+        if (scale_used) *scale_used = scale;
+
+        fz_drop_buffer(ctx, contents);
+        pdf_drop_obj(ctx, resources);
+        fz_drop_story(ctx, story);
+
+        if (more && scale_low >= 1.0f) {
+            /* Content didn't fit and no scaling allowed — report overflow */
+            errcode = 2;
+        }
+    }
+    fz_catch(ctx) { errcode = 1; }
+    return errcode;
+}
+
+// ============================================================
 // PDF creation
 // ============================================================
 
