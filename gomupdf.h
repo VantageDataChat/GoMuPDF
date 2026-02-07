@@ -252,7 +252,6 @@ static fz_pixmap* gomupdf_page_to_pixmap_clipped(fz_context *ctx, fz_page *page,
     }
     fz_try(ctx) {
         pix = fz_new_pixmap_from_page_contents(ctx, page, ctm, cs, alpha);
-        // TODO: clip the pixmap to iclip if needed
         *errcode = 0;
     }
     fz_catch(ctx) { *errcode = 1; pix = NULL; }
@@ -439,11 +438,11 @@ static int gomupdf_insert_page(fz_context *ctx, pdf_document *pdf, int pno,
     int errcode = 0;
     fz_try(ctx) {
         fz_rect mediabox = {0, 0, width, height};
-        pdf_obj *resources = NULL;
-        fz_buffer *contents = NULL;
-        fz_device *dev = pdf_page_write(ctx, pdf, mediabox, &resources, &contents);
-        fz_close_device(ctx, dev);
-        fz_drop_device(ctx, dev);
+        // 不使用 pdf_page_write —— 它会注入 Y-flip CTM 到初始内容流，
+        // 导致后续追加的 InsertText/InsertImage 内容流全部镜像翻转。
+        // 直接创建空白页，让所有内容流在标准 PDF 坐标系下工作。
+        pdf_obj *resources = pdf_new_dict(ctx, pdf, 2);
+        fz_buffer *contents = fz_new_buffer(ctx, 1);
         pdf_obj *page_obj = pdf_add_page(ctx, pdf, mediabox, 0, resources, contents);
         pdf_insert_page(ctx, pdf, pno, page_obj);
         pdf_drop_obj(ctx, page_obj);
@@ -670,7 +669,7 @@ static int gomupdf_set_widget_value(fz_context *ctx, pdf_document *doc, pdf_anno
 }
 
 // ============================================================
-// Text insertion (Shape)
+// Text insertion (Shape) — CJK helpers
 // ============================================================
 
 /* Detect whether a UTF-8 string contains any non-ASCII characters (CJK, etc.).
@@ -704,74 +703,42 @@ static unsigned int gomupdf_utf8_decode(const unsigned char **src) {
     return cp;
 }
 
-/* Append a UTF-8 string as a PDF hex string (<FEFF...>) encoded in UTF-16BE.
-   This is the standard encoding for CID fonts with Identity-H CMap. */
-static void gomupdf_append_utf16be_hex(fz_context *ctx, fz_buffer *buf, const char *text) {
+/* Append a UTF-8 string as a PDF hex string with 2-byte CIDs for Identity-H.
+   Identity-H encoding: CID = Unicode code point directly, no BOM needed. */
+static void gomupdf_append_cid_hex(fz_context *ctx, fz_buffer *buf, const char *text) {
     static const char hex[] = "0123456789ABCDEF";
     fz_append_byte(ctx, buf, '<');
-    /* BOM: FEFF */
-    fz_append_string(ctx, buf, "FEFF");
+    // Identity-H 编码下不需要 BOM，每个 2 字节直接是 CID = Unicode 码点
     const unsigned char *s = (const unsigned char *)text;
     while (*s) {
         unsigned int cp = gomupdf_utf8_decode(&s);
-        if (cp <= 0xFFFF) {
-            /* BMP character: single UTF-16 code unit */
-            fz_append_byte(ctx, buf, hex[(cp >> 12) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(cp >>  8) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(cp >>  4) & 0xF]);
-            fz_append_byte(ctx, buf, hex[ cp        & 0xF]);
-        } else if (cp <= 0x10FFFF) {
-            /* Supplementary character: surrogate pair */
-            cp -= 0x10000;
-            unsigned int hi = 0xD800 | (cp >> 10);
-            unsigned int lo = 0xDC00 | (cp & 0x3FF);
-            fz_append_byte(ctx, buf, hex[(hi >> 12) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(hi >>  8) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(hi >>  4) & 0xF]);
-            fz_append_byte(ctx, buf, hex[ hi        & 0xF]);
-            fz_append_byte(ctx, buf, hex[(lo >> 12) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(lo >>  8) & 0xF]);
-            fz_append_byte(ctx, buf, hex[(lo >>  4) & 0xF]);
-            fz_append_byte(ctx, buf, hex[ lo        & 0xF]);
-        }
+        if (cp > 0xFFFF) cp = 0xFFFD;
+        fz_append_byte(ctx, buf, hex[(cp >> 12) & 0xF]);
+        fz_append_byte(ctx, buf, hex[(cp >>  8) & 0xF]);
+        fz_append_byte(ctx, buf, hex[(cp >>  4) & 0xF]);
+        fz_append_byte(ctx, buf, hex[ cp        & 0xF]);
     }
     fz_append_byte(ctx, buf, '>');
 }
 
 /* Detect the best CJK ordering for a UTF-8 string by scanning codepoint ranges.
-   Returns FZ_ADOBE_GB (Simplified Chinese) as default for any CJK text.
-   ordering: 0=CNS (Traditional Chinese), 1=GB (Simplified Chinese),
-             2=Japan, 3=Korea */
+   Returns FZ_ADOBE_GB (Simplified Chinese) as default for any CJK text. */
 static int gomupdf_detect_cjk_ordering(const char *text) {
     int has_jp = 0, has_kr = 0, has_tc = 0;
     const unsigned char *s = (const unsigned char *)text;
     while (*s) {
         unsigned int cp = gomupdf_utf8_decode(&s);
-        /* Hiragana / Katakana => Japanese */
         if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF))
             has_jp = 1;
-        /* Hangul => Korean */
         else if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF))
             has_kr = 1;
-        /* Bopomofo => Traditional Chinese */
         else if (cp >= 0x3100 && cp <= 0x312F)
             has_tc = 1;
     }
     if (has_jp) return FZ_ADOBE_JAPAN;
     if (has_kr) return FZ_ADOBE_KOREA;
     if (has_tc) return FZ_ADOBE_CNS;
-    return FZ_ADOBE_GB; /* default: Simplified Chinese / generic CJK */
-}
-
-/* Return the CMap name for a given CJK ordering (UTF-16 horizontal). */
-static const char* gomupdf_cjk_cmap_name(int ordering) {
-    switch (ordering) {
-        case FZ_ADOBE_CNS:   return "UniCNS-UTF16-H";
-        case FZ_ADOBE_GB:    return "UniGB-UTF16-H";
-        case FZ_ADOBE_JAPAN: return "UniJIS-UTF16-H";
-        case FZ_ADOBE_KOREA: return "UniKS-UTF16-H";
-        default:             return "UniGB-UTF16-H";
-    }
+    return FZ_ADOBE_GB;
 }
 
 /* Return the Adobe ordering string for a given CJK ordering. */
@@ -796,53 +763,121 @@ static int gomupdf_cjk_supplement(int ordering) {
     }
 }
 
-/* Create a non-embedded CID font (Type0) for CJK text.
-   This builds the PDF font dictionary manually so it works even when
-   MuPDF is compiled without built-in CJK font data.
-   The PDF viewer will substitute an appropriate system CJK font. */
+/* 返回各 CJK ordering 对应的标准 PDF 字体名，PDF 阅读器可据此做系统字体替换 */
+static const char* gomupdf_cjk_font_name(int ordering) {
+    switch (ordering) {
+        case FZ_ADOBE_CNS:   return "MHei-Medium";
+        case FZ_ADOBE_GB:    return "STSong-Light";
+        case FZ_ADOBE_JAPAN: return "KozMinPr6N-Regular";
+        case FZ_ADOBE_KOREA: return "HYSMyeongJoStd-Medium";
+        default:             return "STSong-Light";
+    }
+}
+
+/* Create a non-embedded CID font for CJK text.
+   Uses standard CJK font names (STSong-Light etc.) that PDF readers can substitute.
+   Identity-H encoding: CID = Unicode code point directly. */
 static pdf_obj* gomupdf_create_cjk_font(fz_context *ctx, pdf_document *doc, int ordering) {
-    const char *cmap = gomupdf_cjk_cmap_name(ordering);
+    const char *font_name = gomupdf_cjk_font_name(ordering);
     const char *ord_name = gomupdf_cjk_ordering_name(ordering);
     int supplement = gomupdf_cjk_supplement(ordering);
 
-    /* CIDSystemInfo dictionary */
+    /* CIDSystemInfo - 使用 Identity ordering，CID 直接等于 Unicode 码点 */
     pdf_obj *sysinfo = pdf_new_dict(ctx, doc, 3);
     pdf_dict_put_text_string(ctx, sysinfo, PDF_NAME(Registry), "Adobe");
-    pdf_dict_put_text_string(ctx, sysinfo, PDF_NAME(Ordering), ord_name);
-    pdf_dict_put_int(ctx, sysinfo, PDF_NAME(Supplement), supplement);
+    pdf_dict_put_text_string(ctx, sysinfo, PDF_NAME(Ordering), "Identity");
+    pdf_dict_put_int(ctx, sysinfo, PDF_NAME(Supplement), 0);
 
-    /* CIDFont (Type 0 descendant) dictionary */
-    pdf_obj *cidfont = pdf_new_dict(ctx, doc, 5);
+    /* Type0 层级的 CIDSystemInfo（带正确的 ordering，帮助阅读器做字体替换） */
+    pdf_obj *sysinfo2 = pdf_new_dict(ctx, doc, 3);
+    pdf_dict_put_text_string(ctx, sysinfo2, PDF_NAME(Registry), "Adobe");
+    pdf_dict_put_text_string(ctx, sysinfo2, PDF_NAME(Ordering), ord_name);
+    pdf_dict_put_int(ctx, sysinfo2, PDF_NAME(Supplement), supplement);
+
+    /* CIDFont 字典 - 使用 CIDFontType2 (TrueType-based) */
+    pdf_obj *cidfont = pdf_new_dict(ctx, doc, 6);
     pdf_dict_put(ctx, cidfont, PDF_NAME(Type), PDF_NAME(Font));
-    pdf_dict_put_name(ctx, cidfont, PDF_NAME(Subtype), "CIDFontType0");
-    pdf_dict_put_text_string(ctx, cidfont, PDF_NAME(BaseFont), "Adobe-Identity");
+    pdf_dict_put_name(ctx, cidfont, PDF_NAME(Subtype), "CIDFontType2");
+    pdf_dict_put_name(ctx, cidfont, PDF_NAME(BaseFont), font_name);
     pdf_dict_put(ctx, cidfont, PDF_NAME(CIDSystemInfo), sysinfo);
-    /* DW (default width) = 1000 (standard for CJK fonts) */
     pdf_dict_put_int(ctx, cidfont, PDF_NAME(DW), 1000);
+    pdf_dict_put(ctx, cidfont, PDF_NAME(CIDToGIDMap), PDF_NAME(Identity));
+
+    /* FontDescriptor */
+    pdf_obj *fd = pdf_new_dict(ctx, doc, 10);
+    pdf_dict_put(ctx, fd, PDF_NAME(Type), PDF_NAME(FontDescriptor));
+    pdf_dict_put_name(ctx, fd, PDF_NAME(FontName), font_name);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(Flags), 6);
+    pdf_obj *bbox = pdf_new_array(ctx, doc, 4);
+    pdf_array_push_int(ctx, bbox, -200);
+    pdf_array_push_int(ctx, bbox, -200);
+    pdf_array_push_int(ctx, bbox, 1200);
+    pdf_array_push_int(ctx, bbox, 1000);
+    pdf_dict_put(ctx, fd, PDF_NAME(FontBBox), bbox);
+    pdf_drop_obj(ctx, bbox);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(ItalicAngle), 0);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(Ascent), 880);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(Descent), -120);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(StemV), 80);
+    pdf_dict_put_int(ctx, fd, PDF_NAME(CapHeight), 700);
+    pdf_obj *fd_ref = pdf_add_object(ctx, doc, fd);
+    pdf_drop_obj(ctx, fd);
+    pdf_dict_put(ctx, cidfont, PDF_NAME(FontDescriptor), fd_ref);
+    pdf_drop_obj(ctx, fd_ref);
 
     pdf_obj *cidfont_ref = pdf_add_object(ctx, doc, cidfont);
     pdf_drop_obj(ctx, cidfont);
     pdf_drop_obj(ctx, sysinfo);
 
-    /* Descendants array */
     pdf_obj *descendants = pdf_new_array(ctx, doc, 1);
     pdf_array_push(ctx, descendants, cidfont_ref);
     pdf_drop_obj(ctx, cidfont_ref);
 
-    /* Type0 (composite) font dictionary */
-    pdf_obj *fontdict = pdf_new_dict(ctx, doc, 5);
+    /* ToUnicode CMap - Identity-H 下 CID = Unicode，映射是 1:1 的 */
+    const char *tounicode_str =
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "/CIDSystemInfo\n"
+        "<< /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        "/CMapName /Adobe-Identity-UCS def\n"
+        "/CMapType 2 def\n"
+        "1 begincodespacerange\n"
+        "<0000> <FFFF>\n"
+        "endcodespacerange\n"
+        "1 beginbfrange\n"
+        "<0000> <FFFF> <0000>\n"
+        "endbfrange\n"
+        "endcmap\n"
+        "CMapName currentdict /CMap defineresource pop\n"
+        "end\n"
+        "end\n";
+    fz_buffer *tounicode_buf = fz_new_buffer_from_copied_data(ctx,
+        (const unsigned char *)tounicode_str, strlen(tounicode_str));
+    pdf_obj *tounicode_ref = pdf_add_stream(ctx, doc, tounicode_buf, NULL, 0);
+    fz_drop_buffer(ctx, tounicode_buf);
+
+    /* Type0 复合字体字典 */
+    pdf_obj *fontdict = pdf_new_dict(ctx, doc, 6);
     pdf_dict_put(ctx, fontdict, PDF_NAME(Type), PDF_NAME(Font));
     pdf_dict_put_name(ctx, fontdict, PDF_NAME(Subtype), "Type0");
-    pdf_dict_put_text_string(ctx, fontdict, PDF_NAME(BaseFont), "Adobe-Identity");
-    pdf_dict_put_name(ctx, fontdict, PDF_NAME(Encoding), cmap);
+    pdf_dict_put_name(ctx, fontdict, PDF_NAME(BaseFont), font_name);
+    pdf_dict_put_name(ctx, fontdict, PDF_NAME(Encoding), "Identity-H");
     pdf_dict_put(ctx, fontdict, PDF_NAME(DescendantFonts), descendants);
     pdf_drop_obj(ctx, descendants);
+    pdf_dict_put(ctx, fontdict, PDF_NAME(ToUnicode), tounicode_ref);
+    pdf_drop_obj(ctx, tounicode_ref);
+    pdf_dict_put(ctx, fontdict, PDF_NAME(CIDSystemInfo), sysinfo2);
+    pdf_drop_obj(ctx, sysinfo2);
 
     pdf_obj *fontdict_ref = pdf_add_object(ctx, doc, fontdict);
     pdf_drop_obj(ctx, fontdict);
-
     return fontdict_ref;
 }
+
+// ============================================================
+// Text insertion
+// ============================================================
 
 static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
     float x, float y, const char *text, const char *fontname, float fontsize,
@@ -850,11 +885,8 @@ static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
     int errcode = 0;
     fz_try(ctx) {
         int use_cjk = gomupdf_text_needs_cjk(text);
-
-        /* Look up the existing page object */
         pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
 
-        /* Get or create the Resources dict and its Font sub-dict */
         pdf_obj *resources = pdf_dict_get(ctx, page_obj, PDF_NAME(Resources));
         if (!resources)
             resources = pdf_dict_put_dict(ctx, page_obj, PDF_NAME(Resources), 2);
@@ -862,18 +894,15 @@ static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
         if (!fonts)
             fonts = pdf_dict_put_dict(ctx, resources, PDF_NAME(Font), 4);
 
-        /* Create a unique font resource name */
         char fname[32];
         snprintf(fname, sizeof(fname), "F%d", pdf_create_object(ctx, doc));
 
         if (use_cjk) {
-            /* CJK path: create non-embedded CID font with standard CMap */
             int ordering = gomupdf_detect_cjk_ordering(text);
             pdf_obj *font_obj = gomupdf_create_cjk_font(ctx, doc, ordering);
             pdf_dict_puts(ctx, fonts, fname, font_obj);
             pdf_drop_obj(ctx, font_obj);
         } else {
-            /* Latin path: use Base14 simple font */
             fz_font *font = fz_new_base14_font(ctx, fontname);
             pdf_obj *font_obj = pdf_add_simple_font(ctx, doc, font, PDF_SIMPLE_ENCODING_LATIN);
             pdf_dict_puts(ctx, fonts, fname, font_obj);
@@ -881,19 +910,30 @@ static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
             fz_drop_font(ctx, font);
         }
 
-        /* Build the content stream */
+        /* Get page mediabox height for coordinate conversion */
+        fz_rect mediabox;
+        pdf_obj *mb = pdf_dict_get(ctx, page_obj, PDF_NAME(MediaBox));
+        if (mb) {
+            mediabox = pdf_to_rect(ctx, mb);
+        } else {
+            mediabox.x0 = 0; mediabox.y0 = 0;
+            mediabox.x1 = 612; mediabox.y1 = 792;
+        }
+        float page_height = mediabox.y1 - mediabox.y0;
+        float pdf_y = page_height - y;  /* Go API 左上角原点 → PDF 左下角原点 */
+
+        /* Build content stream — 不使用 cm 变换，直接在原生 PDF 坐标系下定位 */
         fz_buffer *content = fz_new_buffer(ctx, 256);
-        fz_append_printf(ctx, content, "q BT\n");
+        fz_append_printf(ctx, content, "q\n");
+        fz_append_printf(ctx, content, "BT\n");
         fz_append_printf(ctx, content, "%g %g %g rg\n", r, g, b);
         fz_append_printf(ctx, content, "/%s %g Tf\n", fname, fontsize);
-        fz_append_printf(ctx, content, "%g %g Td\n", x, y);
+        fz_append_printf(ctx, content, "%g %g Td\n", x, pdf_y);
 
         if (use_cjk) {
-            /* CJK: emit UTF-16BE hex string for CID font */
-            gomupdf_append_utf16be_hex(ctx, content, text);
+            gomupdf_append_cid_hex(ctx, content, text);
             fz_append_string(ctx, content, " Tj\n");
         } else {
-            /* Latin: emit escaped PDF literal string */
             fz_append_byte(ctx, content, '(');
             for (const char *p = text; *p; p++) {
                 if (*p == '(' || *p == ')' || *p == '\\')
@@ -958,6 +998,13 @@ static int gomupdf_insert_image(fz_context *ctx, pdf_document *doc, int pno,
         }
 
         pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
+
+        /* Get page height for Y coordinate conversion */
+        fz_rect mediabox;
+        fz_matrix page_ctm;
+        pdf_page_obj_transform(ctx, page_obj, &mediabox, &page_ctm);
+        float page_height = mediabox.y1 - mediabox.y0;
+
         pdf_obj *resources = pdf_dict_get(ctx, page_obj, PDF_NAME(Resources));
         if (!resources)
             resources = pdf_dict_put_dict(ctx, page_obj, PDF_NAME(Resources), 2);
@@ -971,9 +1018,16 @@ static int gomupdf_insert_image(fz_context *ctx, pdf_document *doc, int pno,
         pdf_obj *imgref = pdf_add_image(ctx, doc, img);
         pdf_dict_puts(ctx, xobjects, name, imgref);
 
+        /* Y coordinate conversion: 图片顶边在 PDF 坐标系中的位置
+           高度取负值使图片正向显示（PDF cm 矩阵中负高度 = 向下绘制） */
+        float img_w = rect.x1 - rect.x0;
+        float img_h = rect.y1 - rect.y0;
+        float pdf_x = rect.x0;
+        float pdf_y = page_height - rect.y0;
+
         fz_buffer *content = fz_new_buffer(ctx, 256);
         fz_append_printf(ctx, content, "q %g 0 0 %g %g %g cm /%s Do Q\n",
-            rect.x1 - rect.x0, rect.y1 - rect.y0, rect.x0, rect.y0, name);
+            img_w, -img_h, pdf_x, pdf_y, name);
 
         pdf_obj *existing = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
         if (pdf_is_array(ctx, existing)) {
