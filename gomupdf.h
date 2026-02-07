@@ -11,11 +11,77 @@
 #include <stdio.h>
 
 // ============================================================
+// System font loading (for Story/HTML CJK support)
+// ============================================================
+
+/* CJK 字体加载回调 — 从系统字体目录加载 */
+static fz_font* gomupdf_load_system_cjk_font(fz_context *ctx,
+    const char *name, int ordering, int serif) {
+    (void)name; (void)serif;
+    const char *fontpath = NULL;
+#ifdef _WIN32
+    switch (ordering) {
+        case FZ_ADOBE_GB:    fontpath = "C:\\Windows\\Fonts\\simsun.ttc"; break;
+        case FZ_ADOBE_CNS:   fontpath = "C:\\Windows\\Fonts\\simsun.ttc"; break;
+        case FZ_ADOBE_JAPAN: fontpath = "C:\\Windows\\Fonts\\msgothic.ttc"; break;
+        case FZ_ADOBE_KOREA: fontpath = "C:\\Windows\\Fonts\\malgun.ttf"; break;
+        default:             fontpath = "C:\\Windows\\Fonts\\simsun.ttc"; break;
+    }
+#elif defined(__APPLE__)
+    (void)ordering;
+    fontpath = "/System/Library/Fonts/PingFang.ttc";
+#else
+    (void)ordering;
+    fontpath = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
+#endif
+    if (!fontpath) return NULL;
+    fz_font *font = NULL;
+    fz_try(ctx) {
+        font = fz_new_font_from_file(ctx, NULL, fontpath, 0, 0);
+    }
+    fz_catch(ctx) { font = NULL; }
+    return font;
+}
+
+/* 普通字体加载回调 — 返回 NULL 让 MuPDF 用内置 Base14 */
+static fz_font* gomupdf_load_system_font(fz_context *ctx,
+    const char *name, int bold, int italic, int needs_exact_metrics) {
+    (void)name; (void)bold; (void)italic; (void)needs_exact_metrics;
+    return NULL;
+}
+
+/* 回退字体加载回调 — 用于找不到主字体时的 fallback */
+static fz_font* gomupdf_load_system_fallback_font(fz_context *ctx,
+    int script, int language, int serif, int bold, int italic) {
+    (void)script; (void)language; (void)serif; (void)bold; (void)italic;
+#ifdef _WIN32
+    const char *fontpath = "C:\\Windows\\Fonts\\simsun.ttc";
+#elif defined(__APPLE__)
+    const char *fontpath = "/System/Library/Fonts/PingFang.ttc";
+#else
+    const char *fontpath = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
+#endif
+    fz_font *font = NULL;
+    fz_try(ctx) {
+        font = fz_new_font_from_file(ctx, NULL, fontpath, 0, 0);
+    }
+    fz_catch(ctx) { font = NULL; }
+    return font;
+}
+
+// ============================================================
 // Context management
 // ============================================================
 
 static fz_context* gomupdf_new_context(void) {
-    return fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
+    fz_context *ctx = fz_new_context(NULL, NULL, FZ_STORE_DEFAULT);
+    if (ctx) {
+        fz_install_load_system_font_funcs(ctx,
+            gomupdf_load_system_font,
+            gomupdf_load_system_cjk_font,
+            gomupdf_load_system_fallback_font);
+    }
+    return ctx;
 }
 
 static void gomupdf_drop_context(fz_context *ctx) {
@@ -395,7 +461,10 @@ static int gomupdf_pdf_save(fz_context *ctx, pdf_document *pdf, const char *file
     opts.permissions = permissions;
     if (owner_pw) strncpy(opts.opwd_utf8, owner_pw, sizeof(opts.opwd_utf8)-1);
     if (user_pw) strncpy(opts.upwd_utf8, user_pw, sizeof(opts.upwd_utf8)-1);
-    fz_try(ctx) { pdf_save_document(ctx, pdf, filename, &opts); }
+    fz_try(ctx) {
+        pdf_subset_fonts(ctx, pdf, 0, NULL);
+        pdf_save_document(ctx, pdf, filename, &opts);
+    }
     fz_catch(ctx) { errcode = 1; }
     return errcode;
 }
@@ -414,6 +483,7 @@ static unsigned char* gomupdf_pdf_tobytes(fz_context *ctx, pdf_document *pdf,
         opts.do_clean = clean;
         opts.do_ascii = ascii;
         opts.do_pretty = pretty;
+        pdf_subset_fonts(ctx, pdf, 0, NULL);
         pdf_write_document(ctx, pdf, out, &opts);
         fz_close_output(ctx, out);
         fz_drop_output(ctx, out);
@@ -1069,18 +1139,14 @@ static int gomupdf_insert_htmlbox(fz_context *ctx, pdf_document *doc, int pno,
     fz_try(ctx) {
         pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
 
-        /* Get page mediabox for Y coordinate conversion */
+        /* Get page mediabox */
         fz_rect mediabox;
         fz_matrix page_ctm;
         pdf_page_obj_transform(ctx, page_obj, &mediabox, &page_ctm);
-        float page_height = mediabox.y1 - mediabox.y0;
 
-        /* Convert from top-left origin (Go API) to PDF bottom-left origin.
-           Input rect: (x0,y0)=top-left, (x1,y1)=bottom-right in top-left coords.
-           PDF rect: (x0, page_height-y1) to (x1, page_height-y0). */
-        float pdf_y0 = page_height - y1;
-        float pdf_y1 = page_height - y0;
-        fz_rect where = {x0, pdf_y0, x1, pdf_y1};
+        /* 不做 Y 坐标转换 — pdf_page_write 的 device 已经自带 Y-flip CTM，
+           所以 Go API 的左上角原点坐标可以直接传给 fz_place_story。 */
+        fz_rect where = {x0, y0, x1, y1};
 
         float rect_w = where.x1 - where.x0;
         float rect_h = where.y1 - where.y0;
@@ -1181,9 +1247,17 @@ static int gomupdf_insert_htmlbox(fz_context *ctx, pdf_document *doc, int pno,
             }
         }
 
-        /* Append the content stream to the page */
+        /* Append the content stream to the page, wrapped in q/Q to isolate
+           pdf_page_write 注入的 Y-flip CTM，防止泄漏到同一页面的其他内容流。 */
+        fz_buffer *wrapped = fz_new_buffer(ctx, 2 + (int)fz_buffer_storage(ctx, contents, NULL) + 3);
+        fz_append_string(ctx, wrapped, "q\n");
+        unsigned char *cdata;
+        size_t clen = fz_buffer_storage(ctx, contents, &cdata);
+        fz_append_data(ctx, wrapped, cdata, clen);
+        fz_append_string(ctx, wrapped, "\nQ\n");
+
         pdf_obj *existing = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
-        pdf_obj *newstream = pdf_add_stream(ctx, doc, contents, NULL, 0);
+        pdf_obj *newstream = pdf_add_stream(ctx, doc, wrapped, NULL, 0);
         if (pdf_is_array(ctx, existing)) {
             if (overlay)
                 pdf_array_push(ctx, existing, newstream);
@@ -1215,6 +1289,7 @@ static int gomupdf_insert_htmlbox(fz_context *ctx, pdf_document *doc, int pno,
         }
         if (scale_used) *scale_used = scale;
 
+        fz_drop_buffer(ctx, wrapped);
         fz_drop_buffer(ctx, contents);
         pdf_drop_obj(ctx, resources);
         fz_drop_story(ctx, story);

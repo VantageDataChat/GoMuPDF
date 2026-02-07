@@ -2458,3 +2458,56 @@ func TestInsertHTMLBoxNonPDF(t *testing.T) {
 		t.Fatalf("InsertHTMLBox on PDF should work: %v", err)
 	}
 }
+
+func TestFontSubsettingSize(t *testing.T) {
+	dir := t.TempDir()
+
+	type testCase struct {
+		name string
+		fn   func(doc *Document, p *Page)
+	}
+
+	cases := []testCase{
+		{"HTMLBox_2CJK", func(doc *Document, p *Page) {
+			p.InsertHTMLBox(Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+				`<p style="font-size:16px;">你好</p>`)
+		}},
+		{"HTMLBox_50CJK", func(doc *Document, p *Page) {
+			p.InsertHTMLBox(Rect{X0: 50, Y0: 50, X1: 500, Y1: 400},
+				`<p style="font-size:14px;">这是一段较长的中文测试文本用来验证字体子集化的效果包含更多不同的汉字春夏秋冬东南西北上下左右大小多少数字和标点</p>`)
+		}},
+		{"HTMLBox_English", func(doc *Document, p *Page) {
+			p.InsertHTMLBox(Rect{X0: 50, Y0: 50, X1: 500, Y1: 200},
+				`<p style="font-size:16px;">Hello World</p>`)
+		}},
+		{"InsertText_CJK", func(doc *Document, p *Page) {
+			p.InsertText(Point{X: 50, Y: 50}, "你好世界测试中文")
+		}},
+	}
+
+	for _, tc := range cases {
+		doc, err := NewPDF()
+		if err != nil {
+			t.Fatalf("NewPDF: %v", err)
+		}
+		p, err := doc.NewPage(-1, 595, 842)
+		if err != nil {
+			t.Fatalf("NewPage: %v", err)
+		}
+		tc.fn(doc, p)
+		p.Close()
+
+		path := filepath.Join(dir, tc.name+".pdf")
+		err = doc.EzSave(path)
+		if err != nil {
+			t.Fatalf("EzSave %s: %v", tc.name, err)
+		}
+		doc.Close()
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", tc.name, err)
+		}
+		t.Logf("%-20s %6d bytes (%5.1f KB)", tc.name, fi.Size(), float64(fi.Size())/1024)
+	}
+}
