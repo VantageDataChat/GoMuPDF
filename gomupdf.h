@@ -678,32 +678,61 @@ static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
     float r, float g, float b) {
     int errcode = 0;
     fz_try(ctx) {
-        fz_font *font = fz_new_base14_font(ctx, fontname);
-        fz_text *fztext = fz_new_text(ctx);
-        fz_matrix trm = fz_make_matrix(fontsize, 0, 0, fontsize, x, y);
-        fz_show_string(ctx, fztext, font, trm, text, 0, 0, FZ_BIDI_LTR, FZ_LANG_UNSET);
-
+        /* Look up the existing page object */
         pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
-        fz_rect mediabox;
-        fz_matrix ctm;
-        pdf_page_obj_transform(ctx, page_obj, &mediabox, &ctm);
 
-        pdf_obj *resources = NULL;
-        fz_buffer *contents = NULL;
-        fz_device *dev = pdf_page_write(ctx, doc, mediabox, &resources, &contents);
+        /* Get or create the Resources dict and its Font sub-dict */
+        pdf_obj *resources = pdf_dict_get(ctx, page_obj, PDF_NAME(Resources));
+        if (!resources)
+            resources = pdf_dict_put_dict(ctx, page_obj, PDF_NAME(Resources), 2);
+        pdf_obj *fonts = pdf_dict_get(ctx, resources, PDF_NAME(Font));
+        if (!fonts)
+            fonts = pdf_dict_put_dict(ctx, resources, PDF_NAME(Font), 4);
 
-        float color[3] = {r, g, b};
-        fz_fill_text(ctx, dev, fztext, fz_identity, fz_device_rgb(ctx), color, 1.0f, fz_default_color_params);
+        /* Create a unique font resource name and add the font to the page */
+        char fname[32];
+        snprintf(fname, sizeof(fname), "F%d", pdf_create_object(ctx, doc));
 
-        fz_close_device(ctx, dev);
-        fz_drop_device(ctx, dev);
-
-        pdf_obj *new_page_obj = pdf_add_page(ctx, doc, mediabox, 0, resources, contents);
-        pdf_drop_obj(ctx, new_page_obj);
-        fz_drop_buffer(ctx, contents);
-        pdf_drop_obj(ctx, resources);
-        fz_drop_text(ctx, fztext);
+        fz_font *font = fz_new_base14_font(ctx, fontname);
+        pdf_obj *font_obj = pdf_add_simple_font(ctx, doc, font, PDF_SIMPLE_ENCODING_LATIN);
+        pdf_dict_puts(ctx, fonts, fname, font_obj);
+        pdf_drop_obj(ctx, font_obj);
         fz_drop_font(ctx, font);
+
+        /* Build the content stream: set color, select font, position, show text */
+        fz_buffer *content = fz_new_buffer(ctx, 256);
+        fz_append_printf(ctx, content, "q BT\n");
+        fz_append_printf(ctx, content, "%g %g %g rg\n", r, g, b);
+        fz_append_printf(ctx, content, "/%s %g Tf\n", fname, fontsize);
+        fz_append_printf(ctx, content, "%g %g Td\n", x, y);
+
+        /* Escape special PDF string characters */
+        fz_append_byte(ctx, content, '(');
+        for (const char *p = text; *p; p++) {
+            if (*p == '(' || *p == ')' || *p == '\\')
+                fz_append_byte(ctx, content, '\\');
+            fz_append_byte(ctx, content, (unsigned char)*p);
+        }
+        fz_append_string(ctx, content, ") Tj\n");
+        fz_append_string(ctx, content, "ET Q\n");
+
+        /* Append the new content stream to the page's Contents array */
+        pdf_obj *existing = pdf_dict_get(ctx, page_obj, PDF_NAME(Contents));
+        if (pdf_is_array(ctx, existing)) {
+            pdf_obj *newstream = pdf_add_stream(ctx, doc, content, NULL, 0);
+            pdf_array_push(ctx, existing, newstream);
+            pdf_drop_obj(ctx, newstream);
+        } else {
+            pdf_obj *arr = pdf_new_array(ctx, doc, 2);
+            if (existing) pdf_array_push(ctx, arr, existing);
+            pdf_obj *newstream = pdf_add_stream(ctx, doc, content, NULL, 0);
+            pdf_array_push(ctx, arr, newstream);
+            pdf_drop_obj(ctx, newstream);
+            pdf_dict_put(ctx, page_obj, PDF_NAME(Contents), arr);
+            pdf_drop_obj(ctx, arr);
+        }
+
+        fz_drop_buffer(ctx, content);
     }
     fz_catch(ctx) { errcode = 1; }
     return errcode;

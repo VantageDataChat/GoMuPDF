@@ -73,7 +73,7 @@ You can also extract the static libraries from [go-fitz](https://github.com/gen2
 ## Installation
 
 ```bash
-go get github.com/nicejuice/gomupdf
+go get github.com/VantageDataChat/GoMuPDF
 ```
 
 ## Quick Start
@@ -83,7 +83,7 @@ package main
 
 import (
     "fmt"
-    "github.com/nicejuice/gomupdf"
+    "github.com/VantageDataChat/GoMuPDF"
 )
 
 func main() {

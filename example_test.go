@@ -5,7 +5,7 @@ package gomupdf_test
 import (
 	"fmt"
 
-	"github.com/nicejuice/gomupdf"
+	"github.com/VantageDataChat/GoMuPDF"
 )
 
 // Example_openDocument demonstrates opening a PDF and extracting text.
