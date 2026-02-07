@@ -1,3 +1,5 @@
+English | [中文](README_CN.md)
+
 # GoMuPDF
 
 Go bindings for MuPDF — a high-performance library for PDF (and other document) data extraction, analysis, conversion & manipulation.
