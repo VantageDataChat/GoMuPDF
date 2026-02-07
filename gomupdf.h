@@ -673,11 +673,184 @@ static int gomupdf_set_widget_value(fz_context *ctx, pdf_document *doc, pdf_anno
 // Text insertion (Shape)
 // ============================================================
 
+/* Detect whether a UTF-8 string contains any non-ASCII characters (CJK, etc.).
+   Returns 1 if CJK/non-Latin content is found, 0 if pure ASCII/Latin. */
+static int gomupdf_text_needs_cjk(const char *text) {
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p > 0x7F) return 1;
+    }
+    return 0;
+}
+
+/* Decode one UTF-8 codepoint from *src, advance *src, return the codepoint.
+   Returns 0xFFFD on invalid sequences. */
+static unsigned int gomupdf_utf8_decode(const unsigned char **src) {
+    const unsigned char *s = *src;
+    unsigned int cp;
+    int extra;
+    if (s[0] < 0x80)       { cp = s[0]; extra = 0; }
+    else if (s[0] < 0xC0)  { cp = 0xFFFD; extra = 0; }
+    else if (s[0] < 0xE0)  { cp = s[0] & 0x1F; extra = 1; }
+    else if (s[0] < 0xF0)  { cp = s[0] & 0x0F; extra = 2; }
+    else if (s[0] < 0xF8)  { cp = s[0] & 0x07; extra = 3; }
+    else                    { cp = 0xFFFD; extra = 0; }
+    s++;
+    for (int i = 0; i < extra; i++) {
+        if ((*s & 0xC0) != 0x80) { cp = 0xFFFD; break; }
+        cp = (cp << 6) | (*s & 0x3F);
+        s++;
+    }
+    *src = s;
+    return cp;
+}
+
+/* Append a UTF-8 string as a PDF hex string (<FEFF...>) encoded in UTF-16BE.
+   This is the standard encoding for CID fonts with Identity-H CMap. */
+static void gomupdf_append_utf16be_hex(fz_context *ctx, fz_buffer *buf, const char *text) {
+    static const char hex[] = "0123456789ABCDEF";
+    fz_append_byte(ctx, buf, '<');
+    /* BOM: FEFF */
+    fz_append_string(ctx, buf, "FEFF");
+    const unsigned char *s = (const unsigned char *)text;
+    while (*s) {
+        unsigned int cp = gomupdf_utf8_decode(&s);
+        if (cp <= 0xFFFF) {
+            /* BMP character: single UTF-16 code unit */
+            fz_append_byte(ctx, buf, hex[(cp >> 12) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(cp >>  8) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(cp >>  4) & 0xF]);
+            fz_append_byte(ctx, buf, hex[ cp        & 0xF]);
+        } else if (cp <= 0x10FFFF) {
+            /* Supplementary character: surrogate pair */
+            cp -= 0x10000;
+            unsigned int hi = 0xD800 | (cp >> 10);
+            unsigned int lo = 0xDC00 | (cp & 0x3FF);
+            fz_append_byte(ctx, buf, hex[(hi >> 12) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(hi >>  8) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(hi >>  4) & 0xF]);
+            fz_append_byte(ctx, buf, hex[ hi        & 0xF]);
+            fz_append_byte(ctx, buf, hex[(lo >> 12) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(lo >>  8) & 0xF]);
+            fz_append_byte(ctx, buf, hex[(lo >>  4) & 0xF]);
+            fz_append_byte(ctx, buf, hex[ lo        & 0xF]);
+        }
+    }
+    fz_append_byte(ctx, buf, '>');
+}
+
+/* Detect the best CJK ordering for a UTF-8 string by scanning codepoint ranges.
+   Returns FZ_ADOBE_GB (Simplified Chinese) as default for any CJK text.
+   ordering: 0=CNS (Traditional Chinese), 1=GB (Simplified Chinese),
+             2=Japan, 3=Korea */
+static int gomupdf_detect_cjk_ordering(const char *text) {
+    int has_jp = 0, has_kr = 0, has_tc = 0;
+    const unsigned char *s = (const unsigned char *)text;
+    while (*s) {
+        unsigned int cp = gomupdf_utf8_decode(&s);
+        /* Hiragana / Katakana => Japanese */
+        if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF))
+            has_jp = 1;
+        /* Hangul => Korean */
+        else if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF))
+            has_kr = 1;
+        /* Bopomofo => Traditional Chinese */
+        else if (cp >= 0x3100 && cp <= 0x312F)
+            has_tc = 1;
+    }
+    if (has_jp) return FZ_ADOBE_JAPAN;
+    if (has_kr) return FZ_ADOBE_KOREA;
+    if (has_tc) return FZ_ADOBE_CNS;
+    return FZ_ADOBE_GB; /* default: Simplified Chinese / generic CJK */
+}
+
+/* Return the CMap name for a given CJK ordering (UTF-16 horizontal). */
+static const char* gomupdf_cjk_cmap_name(int ordering) {
+    switch (ordering) {
+        case FZ_ADOBE_CNS:   return "UniCNS-UTF16-H";
+        case FZ_ADOBE_GB:    return "UniGB-UTF16-H";
+        case FZ_ADOBE_JAPAN: return "UniJIS-UTF16-H";
+        case FZ_ADOBE_KOREA: return "UniKS-UTF16-H";
+        default:             return "UniGB-UTF16-H";
+    }
+}
+
+/* Return the Adobe ordering string for a given CJK ordering. */
+static const char* gomupdf_cjk_ordering_name(int ordering) {
+    switch (ordering) {
+        case FZ_ADOBE_CNS:   return "CNS1";
+        case FZ_ADOBE_GB:    return "GB1";
+        case FZ_ADOBE_JAPAN: return "Japan1";
+        case FZ_ADOBE_KOREA: return "Korea1";
+        default:             return "GB1";
+    }
+}
+
+/* Return the supplement number for a given CJK ordering. */
+static int gomupdf_cjk_supplement(int ordering) {
+    switch (ordering) {
+        case FZ_ADOBE_CNS:   return 7;
+        case FZ_ADOBE_GB:    return 5;
+        case FZ_ADOBE_JAPAN: return 7;
+        case FZ_ADOBE_KOREA: return 2;
+        default:             return 5;
+    }
+}
+
+/* Create a non-embedded CID font (Type0) for CJK text.
+   This builds the PDF font dictionary manually so it works even when
+   MuPDF is compiled without built-in CJK font data.
+   The PDF viewer will substitute an appropriate system CJK font. */
+static pdf_obj* gomupdf_create_cjk_font(fz_context *ctx, pdf_document *doc, int ordering) {
+    const char *cmap = gomupdf_cjk_cmap_name(ordering);
+    const char *ord_name = gomupdf_cjk_ordering_name(ordering);
+    int supplement = gomupdf_cjk_supplement(ordering);
+
+    /* CIDSystemInfo dictionary */
+    pdf_obj *sysinfo = pdf_new_dict(ctx, doc, 3);
+    pdf_dict_put_text_string(ctx, sysinfo, PDF_NAME(Registry), "Adobe");
+    pdf_dict_put_text_string(ctx, sysinfo, PDF_NAME(Ordering), ord_name);
+    pdf_dict_put_int(ctx, sysinfo, PDF_NAME(Supplement), supplement);
+
+    /* CIDFont (Type 0 descendant) dictionary */
+    pdf_obj *cidfont = pdf_new_dict(ctx, doc, 5);
+    pdf_dict_put(ctx, cidfont, PDF_NAME(Type), PDF_NAME(Font));
+    pdf_dict_put_name(ctx, cidfont, PDF_NAME(Subtype), "CIDFontType0");
+    pdf_dict_put_text_string(ctx, cidfont, PDF_NAME(BaseFont), "Adobe-Identity");
+    pdf_dict_put(ctx, cidfont, PDF_NAME(CIDSystemInfo), sysinfo);
+    /* DW (default width) = 1000 (standard for CJK fonts) */
+    pdf_dict_put_int(ctx, cidfont, PDF_NAME(DW), 1000);
+
+    pdf_obj *cidfont_ref = pdf_add_object(ctx, doc, cidfont);
+    pdf_drop_obj(ctx, cidfont);
+    pdf_drop_obj(ctx, sysinfo);
+
+    /* Descendants array */
+    pdf_obj *descendants = pdf_new_array(ctx, doc, 1);
+    pdf_array_push(ctx, descendants, cidfont_ref);
+    pdf_drop_obj(ctx, cidfont_ref);
+
+    /* Type0 (composite) font dictionary */
+    pdf_obj *fontdict = pdf_new_dict(ctx, doc, 5);
+    pdf_dict_put(ctx, fontdict, PDF_NAME(Type), PDF_NAME(Font));
+    pdf_dict_put_name(ctx, fontdict, PDF_NAME(Subtype), "Type0");
+    pdf_dict_put_text_string(ctx, fontdict, PDF_NAME(BaseFont), "Adobe-Identity");
+    pdf_dict_put_name(ctx, fontdict, PDF_NAME(Encoding), cmap);
+    pdf_dict_put(ctx, fontdict, PDF_NAME(DescendantFonts), descendants);
+    pdf_drop_obj(ctx, descendants);
+
+    pdf_obj *fontdict_ref = pdf_add_object(ctx, doc, fontdict);
+    pdf_drop_obj(ctx, fontdict);
+
+    return fontdict_ref;
+}
+
 static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
     float x, float y, const char *text, const char *fontname, float fontsize,
     float r, float g, float b) {
     int errcode = 0;
     fz_try(ctx) {
+        int use_cjk = gomupdf_text_needs_cjk(text);
+
         /* Look up the existing page object */
         pdf_obj *page_obj = pdf_lookup_page_obj(ctx, doc, pno);
 
@@ -689,31 +862,46 @@ static int gomupdf_insert_text(fz_context *ctx, pdf_document *doc, int pno,
         if (!fonts)
             fonts = pdf_dict_put_dict(ctx, resources, PDF_NAME(Font), 4);
 
-        /* Create a unique font resource name and add the font to the page */
+        /* Create a unique font resource name */
         char fname[32];
         snprintf(fname, sizeof(fname), "F%d", pdf_create_object(ctx, doc));
 
-        fz_font *font = fz_new_base14_font(ctx, fontname);
-        pdf_obj *font_obj = pdf_add_simple_font(ctx, doc, font, PDF_SIMPLE_ENCODING_LATIN);
-        pdf_dict_puts(ctx, fonts, fname, font_obj);
-        pdf_drop_obj(ctx, font_obj);
-        fz_drop_font(ctx, font);
+        if (use_cjk) {
+            /* CJK path: create non-embedded CID font with standard CMap */
+            int ordering = gomupdf_detect_cjk_ordering(text);
+            pdf_obj *font_obj = gomupdf_create_cjk_font(ctx, doc, ordering);
+            pdf_dict_puts(ctx, fonts, fname, font_obj);
+            pdf_drop_obj(ctx, font_obj);
+        } else {
+            /* Latin path: use Base14 simple font */
+            fz_font *font = fz_new_base14_font(ctx, fontname);
+            pdf_obj *font_obj = pdf_add_simple_font(ctx, doc, font, PDF_SIMPLE_ENCODING_LATIN);
+            pdf_dict_puts(ctx, fonts, fname, font_obj);
+            pdf_drop_obj(ctx, font_obj);
+            fz_drop_font(ctx, font);
+        }
 
-        /* Build the content stream: set color, select font, position, show text */
+        /* Build the content stream */
         fz_buffer *content = fz_new_buffer(ctx, 256);
         fz_append_printf(ctx, content, "q BT\n");
         fz_append_printf(ctx, content, "%g %g %g rg\n", r, g, b);
         fz_append_printf(ctx, content, "/%s %g Tf\n", fname, fontsize);
         fz_append_printf(ctx, content, "%g %g Td\n", x, y);
 
-        /* Escape special PDF string characters */
-        fz_append_byte(ctx, content, '(');
-        for (const char *p = text; *p; p++) {
-            if (*p == '(' || *p == ')' || *p == '\\')
-                fz_append_byte(ctx, content, '\\');
-            fz_append_byte(ctx, content, (unsigned char)*p);
+        if (use_cjk) {
+            /* CJK: emit UTF-16BE hex string for CID font */
+            gomupdf_append_utf16be_hex(ctx, content, text);
+            fz_append_string(ctx, content, " Tj\n");
+        } else {
+            /* Latin: emit escaped PDF literal string */
+            fz_append_byte(ctx, content, '(');
+            for (const char *p = text; *p; p++) {
+                if (*p == '(' || *p == ')' || *p == '\\')
+                    fz_append_byte(ctx, content, '\\');
+                fz_append_byte(ctx, content, (unsigned char)*p);
+            }
+            fz_append_string(ctx, content, ") Tj\n");
         }
-        fz_append_string(ctx, content, ") Tj\n");
         fz_append_string(ctx, content, "ET Q\n");
 
         /* Append the new content stream to the page's Contents array */

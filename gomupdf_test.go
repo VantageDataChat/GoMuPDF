@@ -2070,6 +2070,53 @@ func TestInsertTextWithOptions(t *testing.T) {
 	}
 }
 
+func TestInsertTextCJK(t *testing.T) {
+	doc := newTestPDFWithPage(t)
+	defer doc.Close()
+
+	page, err := doc.LoadPage(0)
+	if err != nil {
+		t.Fatalf("LoadPage: %v", err)
+	}
+	defer page.Close()
+
+	// Insert Chinese text
+	n, err := page.InsertText(NewPoint(72, 200), "你好世界", WithFontSize(14))
+	if err != nil {
+		t.Fatalf("InsertText CJK: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1, got %d", n)
+	}
+
+	// Insert Japanese text
+	n, err = page.InsertText(NewPoint(72, 230), "こんにちは", WithFontSize(14))
+	if err != nil {
+		t.Fatalf("InsertText Japanese: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1, got %d", n)
+	}
+
+	// Insert Korean text
+	n, err = page.InsertText(NewPoint(72, 260), "안녕하세요", WithFontSize(14))
+	if err != nil {
+		t.Fatalf("InsertText Korean: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1, got %d", n)
+	}
+
+	// Insert mixed Latin + CJK text
+	n, err = page.InsertText(NewPoint(72, 290), "Hello 你好", WithFontSize(14))
+	if err != nil {
+		t.Fatalf("InsertText mixed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1, got %d", n)
+	}
+}
+
 // --- Image insertion tests ---
 
 func TestInsertImageEmpty(t *testing.T) {
